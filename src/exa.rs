@@ -9,26 +9,26 @@ extern crate locale;
 extern crate natord;
 extern crate num_cpus;
 extern crate number_prefix;
-extern crate scoped_threadpool;
+extern crate rayon;
 extern crate term_grid;
 extern crate unicode_width;
 extern crate users;
 extern crate zoneinfo_compiled;
 extern crate term_size;
+extern crate inlinable_string;
 
 #[cfg(feature="git")] extern crate git2;
 
 #[macro_use] extern crate lazy_static;
 #[macro_use] extern crate log;
 
-
 use std::env::var_os;
 use std::ffi::{OsStr, OsString};
 use std::io::{stderr, Write, Result as IOResult};
 use std::path::{Component, PathBuf};
+use std::borrow::Cow;
 
 use ansi_term::{ANSIStrings, Style};
-use scoped_threadpool::Pool;
 
 use fs::{Dir, File};
 use fs::feature::ignore::IgnoreCache;
@@ -126,7 +126,7 @@ impl<'args, 'w, W: Write + 'w> Exa<'args, 'w, W> {
         let mut exit_status = 0;
 
         for file_path in &self.args {
-            match File::new(PathBuf::from(file_path), None, None) {
+            match File::new(Cow::Owned(PathBuf::from(file_path)), None, None) {
                 Err(e) => {
                     exit_status = 2;
                     writeln!(stderr(), "{:?}: {}", file_path, e)?;
@@ -152,20 +152,15 @@ impl<'args, 'w, W: Write + 'w> Exa<'args, 'w, W> {
         let no_files = files.is_empty();
         let is_only_dir = dirs.len() == 1 && no_files;
 
-        let n_threads = std::env::var("EXA_IO_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or_else(|| num_cpus::get() as u32)
-            .max(1); // scoped_threadpool panics if the pool has 0 threads
-        let mut pool = Pool::new(n_threads);
-
         self.options.filter.filter_argument_files(&mut files);
-        self.print_files(None, files)?;
+        self.print_files(None, &files)?;
 
-        self.print_dirs(dirs, no_files, is_only_dir, exit_status, &mut pool)
+        self.print_dirs(&dirs, no_files, is_only_dir, exit_status)
     }
 
-    fn print_dirs(&mut self, dir_files: Vec<Dir>, mut first: bool, is_only_dir: bool, exit_status: i32, pool: &mut Pool) -> IOResult<i32> {
+    fn print_dirs(&mut self, dir_files: &[Dir], mut first: bool, is_only_dir: bool, exit_status: i32) -> IOResult<i32> {
+        let mut children = Vec::new();
+        let mut child_dirs = Vec::new();
         for dir in dir_files {
 
             // Put a gap between directories, or between the list of files and
@@ -183,13 +178,8 @@ impl<'args, 'w, W: Write + 'w> Exa<'args, 'w, W> {
                 writeln!(self.writer, "{}:", ANSIStrings(&bits))?;
             }
 
-            let mut children = Vec::new();
-            for file in dir.files(self.options.filter.dot_filter, self.ignore.as_ref(), Some(pool)) {
-                match file {
-                    Ok(file)       => children.push(file),
-                    Err((path, e)) => writeln!(stderr(), "[{}: {}]", path.display(), e)?,
-                }
-            };
+            children.clear();
+            let _ = dir.files(self.options.filter.dot_filter, self.ignore.as_ref(), &mut children);
 
             self.options.filter.filter_child_files(&mut children);
             self.options.filter.sort_files(&mut children);
@@ -198,7 +188,7 @@ impl<'args, 'w, W: Write + 'w> Exa<'args, 'w, W> {
                 let depth = dir.path.components().filter(|&c| c != Component::CurDir).count() + 1;
                 if !recurse_opts.tree && !recurse_opts.is_too_deep(depth) {
 
-                    let mut child_dirs = Vec::new();
+                    child_dirs.clear();
                     for child_dir in children.iter().filter(|f| f.is_directory()) {
                         match child_dir.to_dir() {
                             Ok(d)  => child_dirs.push(d),
@@ -206,8 +196,8 @@ impl<'args, 'w, W: Write + 'w> Exa<'args, 'w, W> {
                         }
                     }
 
-                    self.print_files(Some(&dir), children)?;
-                    match self.print_dirs(child_dirs, false, false, exit_status, pool) {
+                    self.print_files(Some(&dir), &children)?;
+                    match self.print_dirs(&child_dirs, false, false, exit_status) {
                         Ok(_) => (),
                         Err(e) => return Err(e),
                     }
@@ -215,7 +205,7 @@ impl<'args, 'w, W: Write + 'w> Exa<'args, 'w, W> {
                 }
             }
 
-            self.print_files(Some(&dir), children)?;
+            self.print_files(Some(&dir), &children)?;
         }
 
         Ok(exit_status)
@@ -224,7 +214,7 @@ impl<'args, 'w, W: Write + 'w> Exa<'args, 'w, W> {
     /// Prints the list of files using whichever view is selected.
     /// For various annoying logistical reasons, each one handles
     /// printing differently...
-    fn print_files(&mut self, dir: Option<&Dir>, files: Vec<File>) -> IOResult<()> {
+    fn print_files(&mut self, dir: Option<&Dir>, files: &[File]) -> IOResult<()> {
         if !files.is_empty() {
             let View { ref mode, ref colours, ref style } = self.options.view;
 

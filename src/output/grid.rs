@@ -22,7 +22,7 @@ impl Options {
 
 
 pub struct Render<'a> {
-    pub files: Vec<File<'a>>,
+    pub files: &'a [File<'a>],
     pub colours: &'a Colours,
     pub style: &'a FileStyle,
     pub opts: &'a Options,
@@ -37,7 +37,7 @@ impl<'a> Render<'a> {
 
         grid.reserve(self.files.len());
 
-        for file in &self.files {
+        for file in self.files {
             let filename = self.style.for_file(file, self.colours).paint();
             let width = filename.width();
 
@@ -48,13 +48,13 @@ impl<'a> Render<'a> {
         }
 
         if let Some(display) = grid.fit_into_width(self.opts.console_width) {
-            write!(w, "{}", display)
+             write!(w, "{}", display)
         }
         else {
             // File names too long for a grid - drop down to just listing them!
             // This isn’t *quite* the same as the lines view, which also
             // displays full link paths.
-            for file in &self.files {
+            for file in self.files {
                 let name_cell = self.style.for_file(file, self.colours).paint();
                 writeln!(w, "{}", name_cell.strings())?;
             }

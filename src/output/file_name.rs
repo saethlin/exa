@@ -228,7 +228,7 @@ impl<'a, 'dir, C: Colours> FileName<'a, 'dir, C> {
     fn coloured_file_name<'unused>(&self) -> Vec<ANSIString<'unused>> {
         let file_style = self.style();
         let mut bits = Vec::new();
-        escape(self.file.name.clone(), &mut bits, file_style, self.colours.control_char());
+        escape(self.file.name.to_string(), &mut bits, file_style, self.colours.control_char());
         bits
     }
 

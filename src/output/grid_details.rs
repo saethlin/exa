@@ -53,7 +53,7 @@ pub struct Render<'a> {
 
     /// The files that have been read from the directory. They should all
     /// hold a reference to it.
-    pub files: Vec<File<'a>>,
+    pub files: &'a [File<'a>],
 
     /// How to colour various pieces of text.
     pub colours: &'a Colours,
@@ -88,7 +88,7 @@ impl<'a> Render<'a> {
     pub fn details(&self) -> DetailsRender<'a> {
         DetailsRender {
             dir: self.dir,
-            files: Vec::new(),
+            files: &[],
             colours: self.colours,
             style: self.style,
             opts: self.details,

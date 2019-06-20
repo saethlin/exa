@@ -5,6 +5,8 @@ use std::io::Error as IOError;
 use std::io::Result as IOResult;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, FileTypeExt};
 use std::path::{Path, PathBuf};
+use std::borrow::Cow;
+use inlinable_string::InlinableString as IString;
 
 use fs::dir::Dir;
 use fs::fields as f;
@@ -24,12 +26,12 @@ pub struct File<'dir> {
     /// This is used to compare against certain filenames (such as checking if
     /// it’s “Makefile” or something) and to highlight only the filename in
     /// colour when displaying the path.
-    pub name: String,
+    pub name: IString,
 
     /// The file’s name’s extension, if present, extracted from the name.
     ///
     /// This is queried many times over, so it’s worth caching it.
-    pub ext: Option<String>,
+    pub ext: Option<IString>,
 
     /// The path that begat this file.
     ///
@@ -37,7 +39,7 @@ pub struct File<'dir> {
     /// around, as certain operations involve looking up the file’s absolute
     /// location (such as searching for compiled files) or using its original
     /// path (following a symlink).
-    pub path: PathBuf,
+    pub path: Cow<'dir, Path>,
 
     /// A cached `metadata` (`stat`) call for this file.
     ///
@@ -56,21 +58,25 @@ pub struct File<'dir> {
     /// as looking up compiled files).
     pub parent_dir: Option<&'dir Dir>,
 
-    pub target_metadata: Option<IOResult<fs::Metadata>>,
+    pub target_metadata: Option<Box<IOResult<fs::Metadata>>>,
 }
 
 impl<'dir> File<'dir> {
-    pub fn new<PD, FN>(path: PathBuf, parent_dir: PD, filename: FN) -> IOResult<File<'dir>>
+    pub fn new<PD>(path: Cow<'dir, Path>, parent_dir: PD, filename: Option<&'static str>) -> IOResult<File<'dir>>
     where PD: Into<Option<&'dir Dir>>,
-          FN: Into<Option<String>>
     {
         let parent_dir = parent_dir.into();
-        let name       = filename.into().unwrap_or_else(|| File::filename(&path));
+        let name       = filename.map(IString::from).unwrap_or_else(|| File::filename(&path));
         let ext        = File::ext(&path);
 
         debug!("Statting file {:?}", &path);
-        let metadata   = fs::symlink_metadata(&path)?;
-        let target_metadata   = if metadata.file_type().is_symlink() {Some(fs::metadata(&path))} else { None };
+        let metadata  = fs::symlink_metadata(&path)?;
+        let target_metadata  = if metadata.file_type().is_symlink() {
+            let path = reorient_target_path(parent_dir.map(|d| d.path.as_ref()), &path);
+            Some(Box::new(fs::metadata(&path)))
+        } else {
+            None
+        };
 
         Ok(File { path, parent_dir, metadata, ext, name, target_metadata})
     }
@@ -78,14 +84,17 @@ impl<'dir> File<'dir> {
     /// A file’s name is derived from its string. This needs to handle directories
     /// such as `/` or `..`, which have no `file_name` component. So instead, just
     /// use the last component as the name.
-    pub fn filename(path: &Path) -> String {
+    pub fn filename(path: &Path) -> IString {
         if let Some(back) = path.components().next_back() {
-            back.as_os_str().to_string_lossy().to_string()
+            IString::from(back.as_os_str().to_string_lossy().as_ref())
         }
         else {
+            use std::fmt::Write;
             // use the path as fallback
             error!("Path {:?} has no last component", path);
-            path.display().to_string()
+            let mut name = String::new();
+            let _ = write!(&mut name, "{}", path.display());
+            IString::from(name)
         }
     }
 
@@ -97,10 +106,10 @@ impl<'dir> File<'dir> {
     /// ASCII lowercasing is used because these extensions are only compared
     /// against a pre-compiled list of extensions which are known to only exist
     /// within ASCII, so it’s alright.
-    pub fn ext(path: &Path) -> Option<String> {
-        let name = path.file_name().map(|f| f.to_string_lossy().to_string())?;
+    pub fn ext(path: &Path) -> Option<IString> {
+        let name = path.file_name().map(|f| f.to_string_lossy())?;
 
-        name.rfind('.').map(|p| name[p+1..].to_ascii_lowercase())
+        name.rfind('.').map(|p| IString::from(&name[p+1..]))
     }
 
     /// Whether this file is a directory on the filesystem.
@@ -131,7 +140,7 @@ impl<'dir> File<'dir> {
     /// Returns an IO error upon failure, but this shouldn’t be used to check
     /// if a `File` is a directory or not! For that, just use `is_directory()`.
     pub fn to_dir(&self) -> IOResult<Dir> {
-        Dir::read_dir(self.path.clone())
+        Dir::read_dir(self.path.to_path_buf())
     }
 
     /// Whether this file is a regular file on the filesystem — that is, not a
@@ -173,25 +182,6 @@ impl<'dir> File<'dir> {
         self.metadata.file_type().is_socket()
     }
 
-
-    /// Re-prefixes the path pointed to by this file, if it’s a symlink, to
-    /// make it an absolute path that can be accessed from whichever
-    /// directory exa is being run from.
-    fn reorient_target_path(&self, path: &Path) -> PathBuf {
-        if path.is_absolute() {
-            path.to_path_buf()
-        }
-        else if let Some(dir) = self.parent_dir {
-            dir.join(&*path)
-        }
-        else if let Some(parent) = self.path.parent() {
-            parent.join(&*path)
-        }
-        else {
-            self.path.join(&*path)
-        }
-    }
-
     /// Again assuming this file is a symlink, follows that link and returns
     /// the result of following it.
     ///
@@ -213,21 +203,27 @@ impl<'dir> File<'dir> {
             Err(e)  => return FileTarget::Err(e),
         };
 
-        let absolute_path = self.reorient_target_path(&path);
-
         // Use plain `metadata` instead of `symlink_metadata` - we *want* to
         // follow links.
-        match self.target_metadata {
-            Some(Ok(ref metadata)) => {
+        match self.target_metadata.as_ref()
+            .unwrap_or_else(|| unreachable!("Called link_target on a regular file")).as_ref() {
+            Ok(ref metadata) => {
                 let ext  = File::ext(&path);
                 let name = File::filename(&path);
-                FileTarget::Ok(Box::new(File { parent_dir: None, path, ext, metadata: metadata.clone(), name, target_metadata: None}))
+                FileTarget::Ok(Box::new(File {
+                    parent_dir: None,
+                    path: path.into(),
+                    ext,
+                    metadata: metadata.clone(),
+                    name,
+                    target_metadata: None
+                }))
+
             }
-            Some(Err(ref e)) => {
+            Err(ref e) => {
                 error!("Error following link {:?}: {:#?}", &path, e);
                 FileTarget::Broken(path)
             }
-            None => unreachable!("Called link_target on a regular file")
         }
     }
 
@@ -434,6 +430,23 @@ impl<'dir> FileTarget<'dir> {
         }
     }
 }
+/// Re-prefixes the path pointed to by this file, if it’s a symlink, to
+/// make it an absolute path that can be accessed from whichever
+/// directory exa is being run from.
+fn reorient_target_path(parent_dir: Option<&Path>, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    }
+    else if let Some(dir) = parent_dir {
+        dir.join(&*path)
+    }
+    else if let Some(parent) = path.parent() {
+        parent.join(&*path)
+    }
+    else {
+        path.join(&*path)
+    }
+}
 
 
 /// More readable aliases for the permission bits exposed by libc.
@@ -467,15 +480,16 @@ mod modes {
 mod ext_test {
     use super::File;
     use std::path::Path;
+    use inlinable_string::InlinableString as IString;
 
     #[test]
     fn extension() {
-        assert_eq!(Some("dat".to_string()), File::ext(Path::new("fester.dat")))
+        assert_eq!(Some(IString::from("dat")), File::ext(Path::new("fester.dat")))
     }
 
     #[test]
     fn dotfile() {
-        assert_eq!(Some("vimrc".to_string()), File::ext(Path::new(".vimrc")))
+        assert_eq!(Some(IString::from("vimrc")), File::ext(Path::new(".vimrc")))
     }
 
     #[test]

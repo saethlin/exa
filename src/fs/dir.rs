@@ -2,8 +2,7 @@ use std::io::{self, Result as IOResult};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-use scoped_threadpool::Pool;
+use std::borrow::Cow;
 
 use fs::File;
 use fs::feature::ignore::IgnoreCache;
@@ -46,51 +45,52 @@ impl Dir {
 
     /// Produce an iterator of IO results of trying to read all the files in
     /// this directory.
-    pub fn files<'dir, 'ig>(&'dir self, dots: DotFilter, ignore: Option<&'ig IgnoreCache>, pool: Option<&mut Pool>) -> Files<'dir, 'ig> {
+    pub fn files<'dir, 'ig>(
+        &'dir self,
+        dot_filter: DotFilter,
+        ignore: Option<&'ig IgnoreCache>,
+        output: &mut Vec<File<'dir>>
+    ) -> Vec<Arc<io::Error>>  {
+        use rayon::prelude::*;
         if let Some(i) = ignore { i.discover_underneath(&self.path); }
 
         // File::new calls std::fs::File::metadata, which on linux calls lstat. On some
         // filesystems this can be very slow, but there's no async filesystem API
         // so all we can do to hide the latency is use system threads.
-        let mut metadata = vec![None; self.contents.len()];
-        if let Some(pool) = pool {
-            let chunksize = (self.contents.len() / pool.thread_count() as usize).max(1);
-            pool.scoped(|scoped| {
-                for (path_chunk, meta_chunk) in self.contents.chunks(chunksize).zip(metadata.chunks_mut(chunksize)) {
-                    scoped.execute(move || {
-                        for (path, e) in path_chunk.iter().zip(meta_chunk.iter_mut()) {
-                            let meta = fs::symlink_metadata(path).map_err(Arc::new);
-                            let link_target = if meta.as_ref().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
-                                Some(fs::metadata(path).map_err(Arc::new))
-                            } else {
-                                None
-                            };
-                            *e = Some((meta, link_target));
-                        }
-                    });
-                }
-            });
-        } else {
-            for (path, e) in self.contents.iter().zip(metadata.iter_mut()) {
-                let meta = fs::symlink_metadata(path).map_err(Arc::new);
-                let link_target = if meta.as_ref().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
-                    Some(fs::metadata(path).map_err(Arc::new))
-                } else {
+
+        let mut paths = Vec::with_capacity(self.contents.len());
+        for file_to_scan in self.contents.iter().filter_map(|path| {
+            let dotfiles = dot_filter.shows_dotfiles();
+                let name =  File::filename(path);
+                if !dotfiles && name.starts_with('.') {
                     None
-                };
-                *e = Some((meta, link_target));
-            }
-
+                } else if ignore.map(|i| i.is_ignored(path)).unwrap_or(false) {
+                    None
+                } else {
+                    Some(path)
+                }
+            }) {
+            paths.push(file_to_scan);
         }
-        let metadata = metadata.into_iter().map(|m| m.unwrap()).collect::<Vec<_>>();
 
-        Files {
-            inner:     self.contents.iter().zip(metadata),
-            dir:       self,
-            dotfiles:  dots.shows_dotfiles(),
-            dots:      dots.dots(),
-            ignore,
+        output.reserve(paths.len() + 2);
+
+        paths.par_iter().map(|path| {
+            File::new(Cow::Borrowed(*path), self, None).unwrap()
+        }).collect_into_vec(output);
+
+        let mut dots = dot_filter.dots();
+        // Append special directories
+        if let Dots::DotNext = dots {
+            dots = Dots::DotDotNext;
+            File::new(Cow::Borrowed(&self.path), self, Some(".")).map(|f| output.push(f)).unwrap();
         }
+        if let Dots::DotDotNext = dots {
+            File::new(Cow::Owned(self.path.join("..")), self, Some("..")).map(|f| output.push(f)).unwrap();
+        }
+
+        Vec::new() // TODO: Actually report errors here somehow
+
     }
 
     /// Whether this directory contains a file with the given path.
@@ -104,7 +104,7 @@ impl Dir {
     }
 }
 
-
+/*
 /// Iterator over reading the contents of a directory as `File` objects.
 pub struct Files<'dir, 'ig> {
 
@@ -153,7 +153,7 @@ impl<'dir, 'ig> Files<'dir, 'ig> {
                     File {
                         name: filename,
                         ext: File::ext(path),
-                        path: path.to_path_buf(),
+                        path: path.into(),
                         metadata: meta,
                         parent_dir: Some(self.dir),
                         target_metadata,
@@ -168,6 +168,7 @@ impl<'dir, 'ig> Files<'dir, 'ig> {
         }
     }
 }
+*/
 
 /// The dot directories that need to be listed before actual files, if any.
 /// If these aren’t being printed, then `FilesNext` is used to skip them.
@@ -183,19 +184,19 @@ enum Dots {
     FilesNext,
 }
 
-
+/*
 impl<'dir, 'ig> Iterator for Files<'dir, 'ig> {
     type Item = Result<File<'dir>, (PathBuf, io::Error)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Dots::DotNext = self.dots {
             self.dots = Dots::DotDotNext;
-            Some(File::new(self.dir.path.to_path_buf(), self.dir, String::from("."))
+            Some(File::new(Cow::Borrowed(&self.dir.path), self.dir, Some(String::from(".")))
                       .map_err(|e| (Path::new(".").to_path_buf(), e)))
         }
         else if let Dots::DotDotNext = self.dots {
             self.dots = Dots::FilesNext;
-            Some(File::new(self.parent(), self.dir, String::from(".."))
+            Some(File::new(self.parent().into(), self.dir, Some(String::from("..")))
                       .map_err(|e| (self.parent(), e)))
         }
         else {
@@ -203,7 +204,7 @@ impl<'dir, 'ig> Iterator for Files<'dir, 'ig> {
         }
     }
 }
-
+*/
 
 /// Usually files in Unix use a leading dot to be hidden or visible, but two
 /// entries in particular are "extra-hidden": `.` and `..`, which only become

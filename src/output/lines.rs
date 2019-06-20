@@ -9,14 +9,14 @@ use style::Colours;
 
 /// The lines view literally just displays each file, line-by-line.
 pub struct Render<'a> {
-    pub files: Vec<File<'a>>,
+    pub files: &'a [File<'a>],
     pub colours: &'a Colours,
     pub style: &'a FileStyle,
 }
 
 impl<'a> Render<'a> {
     pub fn render<W: Write>(&self, w: &mut W) -> IOResult<()> {
-        for file in &self.files {
+        for file in self.files {
             let name_cell = self.render_file(file).paint();
             writeln!(w, "{}", ANSIStrings(&name_cell))?;
         }
